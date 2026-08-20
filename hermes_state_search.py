@@ -42,8 +42,39 @@ logger = logging.getLogger("hermes_state")
 # ``%`` is deliberately excluded: a CJK query falls back to a LIKE search that
 # needs it preserved as a literal (that path escapes wildcards itself), so
 # stripping it here widened those queries onto unrelated rows.
-_FTS5_SPECIAL_CHARS = '+{}():"^@/#&|~[]<>,;!?$=\\\''
+_FTS5_SPECIAL_CHARS = '+{}():"^@/#&|~[]<>,;!?$=\\\\\''
 _FTS5_SPECIAL_RE = re.compile(f"[{re.escape(_FTS5_SPECIAL_CHARS)}]")
+
+# Русские/общие стоп-слова для NL-расширения запроса (L1): предлоги, союзы,
+# местоимения, вопросительные слова и глаголы-просьбы. Их наличие в
+# естественном вопросе гарантированно убивает FTS5 AND-семантику («сколько
+# алиасов в ssh-конфиге» — «в» не встречается рядом с остальными токенами),
+# а поисковой ценности они не несут. Список только самых частотных — удаление
+# слова из запроса почти никогда не снижает recall, а вот сохранение — часто.
+_NL_STOPWORDS = frozenset(
+    """
+    в во и с со на по за из у о к от до для при без над под про между через
+    перед после об а но или иль же бы ли то это тот та те эта эти этот та
+    что как где когда какой какая какое какие каким каком каких сколько почему зачем кто чего
+    чем чём кому кого
+    мой моя мои моё мое твой твоя твои наша наш наши ваша ваш ваши его её ее
+    их там тут здесь невесть
+    есть был была было были будет будут
+    все всё ещё еще уже очень можно нужно надо нельзя
+    сделать сделай сделайте помоги помогите проверь проверьте покажи покажите
+    расскажи расскажите объясни объясните напиши напишите добавь добавьте
+    найди найдите посмотри посмотрите оцени оцените запусти запустите
+    установи установите настрой настройте проанализируй сравни
+    который которая которое которые которого
+    """.split()
+)
+
+# Типичные русские падежные/множественные окончания из 2 символов: если слово
+# заканчивается на одно из них, это почти наверняка флексия, а не часть корня
+# («алиасов»→«алиас*», «серверов»→«сервер*», «проверкой»→«проверк*»).
+_RU_ENDING2 = frozenset(
+    "ов ев ёв ах ях ом ём ам ям ей ий ый ой ую юю ая яя ое ее ие ые им ым их ых".split()
+)
 
 
 class SessionSearchMixin:
@@ -1316,7 +1347,166 @@ class SessionSearchMixin:
                 run = 0
         return run == 1
 
+    def _expand_nl_query(
+        self,
+        query: str,
+    ) -> Optional[Dict[str, str]]:
+        """Expand a natural-language query into FTS5-friendly variants (L1).
+
+        A natural question like «сколько алиасов в ssh-конфиге и какие
+        серверы там прописаны?» fails plain FTS5 twice: stopwords («в», «и»,
+        «там») rarely co-occur with the meaningful terms in one message, and
+        Russian morphology means the indexed form differs from the query form
+        («алиасов» vs «алиасы»). This method builds up to three progressively
+        looser FTS5 queries:
+
+          - ``and``: meaningful terms with prefix wildcards, AND-joined
+            (fixes morphology while keeping precision);
+          - ``or``: the same terms OR-joined (fixes the multi-message
+            stopword problem — any term anywhere);
+          - ``bare``: meaningful terms without wildcards, for the trigram /
+            LIKE substring paths downstream.
+
+        Returns ``None`` when the query has fewer than two meaningful terms
+        (nothing to gain from expansion) or is entirely stopwords.
+        """
+        meaningful: List[str] = []
+        and_parts: List[str] = []
+        or_parts: List[str] = []
+
+        def _add_subtoken(sub: str) -> None:
+            """Normalise one atomic token (no separators) into the variants."""
+            if not sub or not re.search(r"[^\W\d_]", sub):  # letters only
+                return
+            low = sub.lower()
+            if low in _NL_STOPWORDS:
+                return
+            meaningful.append(sub)
+            prefixed = self._morph_prefix(sub)
+            and_parts.append(prefixed)
+            or_parts.append(prefixed)
+
+        for raw_tok in re.findall(r'"[^"]+"|\S+', query):
+            if raw_tok.startswith('"') and raw_tok.endswith('"'):
+                phrase = raw_tok[1:-1].strip()
+                if not phrase:
+                    continue
+                # A quoted phrase that the sanitizer wrapped because of
+                # separators (ssh-конфиге, 10.10.20.0/24) is not a real
+                # exact-phrase intent — split it like a bare token. Pure
+                # word phrases (spaces only) keep exact-phrase semantics.
+                if re.search(r"[^A-Za-zА-Яа-яЁё0-9\s]", phrase):
+                    for sub in re.split(r"[^A-Za-zА-Яа-яЁё0-9]+", phrase):
+                        _add_subtoken(sub)
+                else:
+                    meaningful.append(phrase)
+                    and_parts.append(raw_tok)
+                    or_parts.append(raw_tok)
+                continue
+            tok = raw_tok.strip('"').strip("*").strip()
+            if not tok or tok.upper() in {"AND", "OR", "NOT", "NEAR"}:
+                continue
+            for sub in re.split(r"[^A-Za-zА-Яа-яЁё0-9]+", tok):
+                _add_subtoken(sub)
+        if len(meaningful) < 2:
+            return None
+        return {
+            "and": " AND ".join(and_parts) if len(and_parts) > 1 else and_parts[0],
+            "or": " OR ".join(or_parts),
+            "bare": " ".join(meaningful),
+        }
+
     @staticmethod
+    def _morph_prefix(tok: str) -> str:
+        """Prefix wildcard for one term: ``алиасов`` -> ``алиас*``.
+
+        Russian inflection lives in the suffix. Heuristic (good enough for a
+        recall-oriented fallback, no morphology library needed):
+
+          - vowel ending («серверы», «конфиге») → drop the single vowel;
+          - consonant ending with a known 2-char plural/genitive ending
+            (-ов/-ев/-ах/-ом/-ей…) → drop 2 («алиасов»→«алиас*»);
+          - 4-char stems → keep whole («порт*», «роль*») — a 3-char prefix
+            matches too many unrelated tokens;
+          - anything else → drop 1 («роутер»→«роуте*», still matches
+            роутер/роутеры/роутера).
+
+        Latin terms get ``*`` appended as-is (English suffixes are shorter;
+        ``config*`` already matches config/configuration). Short tokens
+        (<4 chars) are returned unchanged.
+        """
+        if len(tok) < 4:
+            return tok
+        if re.search(r"[а-яё]", tok, re.I):
+            if re.search(r"[аеёиоуыэюя]$", tok, re.I):
+                return f"{tok[:-1]}*"
+            if len(tok) >= 6 and tok[-2:].lower() in _RU_ENDING2:
+                return f"{tok[:-2]}*"
+            if len(tok) == 4:
+                return f"{tok}*"
+            return f"{tok[:-1]}*"
+        return f"{tok}*"
+
+    def _run_fts5_search(
+        self,
+        fts_query: str,
+        *,
+        order_by_sql: str,
+        include_inactive: bool,
+        source_filter: List[str] = None,
+        exclude_sources: List[str] = None,
+        role_filter: List[str] = None,
+        limit: int = 20,
+        offset: int = 0,
+    ) -> Optional[List[Dict[str, Any]]]:
+        """Run a raw FTS5 query against the main ``messages_fts`` table.
+
+        Unlike ``_search_messages_impl``'s inline SQL this takes the MATCH
+        expression verbatim (no extra quoting) — used by the NL-expansion
+        fallback which already builds a syntactically valid query with prefix
+        wildcards and OR groups. Returns rows in the same shape as the main
+        path, or ``None`` when the query fails at runtime so the caller can
+        continue down the fallback chain.
+        """
+        fts_where = ["messages_fts MATCH ?"]
+        fts_params: list = [fts_query]
+        if not include_inactive:
+            fts_where.append("(m.active = 1 OR m.compacted = 1)")
+        if source_filter is not None:
+            fts_where.append(f"s.source IN ({','.join('?' for _ in source_filter)})")
+            fts_params.extend(source_filter)
+        if exclude_sources is not None:
+            fts_where.append(f"s.source NOT IN ({','.join('?' for _ in exclude_sources)})")
+            fts_params.extend(exclude_sources)
+        if role_filter:
+            fts_where.append(f"m.role IN ({','.join('?' for _ in role_filter)})")
+            fts_params.extend(role_filter)
+        fts_sql = f"""
+            SELECT
+                m.id,
+                m.session_id,
+                m.role,
+                snippet(messages_fts, -1, '>>>', '<<<', '...', 40) AS snippet,
+                m.timestamp,
+                m.tool_name,
+                s.source,
+                s.model,
+                s.started_at AS session_started
+            FROM messages_fts
+            JOIN messages m ON m.id = messages_fts.rowid
+            JOIN sessions s ON s.id = m.session_id
+            WHERE {' AND '.join(fts_where)}
+            {order_by_sql}
+            LIMIT ? OFFSET ?
+        """
+        fts_params.extend([limit, offset])
+        with self._read_ctx() as conn:
+            try:
+                cursor = conn.execute(fts_sql, fts_params)
+            except sqlite3.OperationalError:
+                return None
+            return [dict(row) for row in cursor.fetchall()]
+
     def _trigram_eligible_tokens(query: str) -> bool:
         """True when every non-operator token is long enough for the trigram
         tokenizer to match (>=3 chars).
@@ -2178,7 +2368,32 @@ class SessionSearchMixin:
             and not is_cjk
             and not (bool(role_filter) and "tool" in role_filter)
         ):
-            _fb_query = query.strip('"').strip()
+            # ── L1: natural-language expansion (stopwords + morphology) ──
+            # A natural question usually fails plain FTS5 (stopwords + AND
+            # across messages + Russian inflection). Try progressively looser
+            # variants before the substring fallbacks: prefixed AND (fixes
+            # morphology, keeps precision) → prefixed OR (fixes stopword/AND
+            # failure). Strictly additive: only runs when the exact search
+            # returned nothing, and never reorders existing hits.
+            expanded = self._expand_nl_query(query)
+            if expanded:
+                for _nl_key in ("and", "or"):
+                    _nl_matches = self._run_fts5_search(
+                        expanded[_nl_key],
+                        order_by_sql=order_by_sql,
+                        include_inactive=include_inactive,
+                        source_filter=source_filter,
+                        exclude_sources=exclude_sources,
+                        role_filter=role_filter,
+                        limit=limit,
+                        offset=offset,
+                    )
+                    if _nl_matches:
+                        matches = _nl_matches
+                        break
+            # The substring-capable indexes below get the stopword-stripped
+            # query so they don't trip over «в», «и», «какие» either.
+            _fb_query = (expanded["bare"] if expanded else query).strip('"').strip()
             if self._fts_cjk_available:
                 cjk_fb = self._run_trigram_search(
                     _fb_query,
@@ -2196,7 +2411,7 @@ class SessionSearchMixin:
             if (
                 not matches
                 and self._trigram_available
-                and self._trigram_eligible_tokens(query)
+                and self._trigram_eligible_tokens(_fb_query)
             ):
                 tri_matches = self._run_trigram_search(
                     _fb_query,
