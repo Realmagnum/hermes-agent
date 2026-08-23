@@ -90,6 +90,39 @@ _HINDSIGHT_GLYPH = "👁️"
 # unique document_id fallback for older APIs.
 _MIN_VERSION_FOR_UPDATE_MODE_APPEND = "0.5.0"
 _VALID_BUDGETS = {"low", "mid", "high"}
+# Reciprocal Rank Fusion constant for multi-bank merges. k=60 is the
+# standard value (Cormack et al.); with per-bank rankings it dampens the
+# top rank so a single bank cannot dominate the merged ordering.
+_RRF_K = 60
+
+
+def _merge_bank_results(bank_results: List[tuple]) -> List[Any]:
+    """Merge per-bank recall result lists into one ranked list (RRF).
+
+    ``bank_results`` is a list of ``(bank_id, results)`` tuples in the order
+    the banks were queried (primary first). Each bank contributes its own
+    ranking; the merged order is by reciprocal-rank-fusion score, so no two
+    banks' raw scores ever need to be comparable. Ties keep primary-bank
+    priority. Exact-duplicate texts (same fact mirrored into two banks) are
+    collapsed to the first occurrence.
+    """
+    fused: Dict[str, Dict[str, Any]] = {}
+    for bank_id, results in bank_results:
+        for rank, item in enumerate(results):
+            if not getattr(item, "text", None):
+                continue
+            key = getattr(item, "id", None) or f"text:{item.text}"
+            entry = fused.get(key)
+            if entry is None:
+                entry = {"item": item, "score": 0.0, "bank": bank_id}
+                fused[key] = entry
+            entry["score"] += 1.0 / (_RRF_K + rank + 1)
+    ordered = sorted(
+        fused.values(), key=lambda e: e["score"], reverse=True
+    )
+    return [(e["bank"], e["item"]) for e in ordered]
+
+
 _PROVIDER_DEFAULT_MODELS = {
     "openai": "gpt-4o-mini",
     "anthropic": "claude-haiku-4-5",
@@ -1302,6 +1335,7 @@ class HindsightMemoryProvider(MemoryProvider):
             {"key": "llm_model", "description": "LLM model", "default": "gpt-4o-mini", "default_from": {"field": "llm_provider", "map": _PROVIDER_DEFAULT_MODELS}, "when": {"mode": "local_embedded"}},
             {"key": "bank_id", "description": "Memory bank name (static fallback when bank_id_template is unset)", "default": "hermes"},
             {"key": "bank_id_template", "description": "Optional template to derive bank_id dynamically. Placeholders: {profile}, {workspace}, {platform}, {user}, {session}. Example: hermes-{profile}", "default": ""},
+            {"key": "recall_banks", "description": "Extra banks to search on recall, comma-separated. The primary bank_id is always queried first with the full budget; secondary banks use a low budget and their results are rank-fused into one list.", "default": ""},
             {"key": "bank_mission", "description": "Mission/purpose description for the memory bank"},
             {"key": "bank_retain_mission", "description": "Custom extraction prompt for memory retention"},
             {"key": "recall_budget", "description": "Recall thoroughness", "default": "mid", "choices": ["low", "mid", "high"]},
@@ -1652,6 +1686,76 @@ class HindsightMemoryProvider(MemoryProvider):
             self._client = client
             return self._run_sync(operation(client))
 
+    def _multi_bank_recall_results(self, query: str):
+        """Run recall across ``self._recall_banks`` and return merged results.
+
+        Returns a list of ``(bank_id, item)`` tuples ordered by reciprocal
+        rank fusion (see :func:`_merge_bank_results`). The primary bank
+        (``self._bank_id``) is queried first with the configured budget and
+        token cap; secondary banks run in parallel with ``budget=low`` and
+        half the tokens so they enrich without dominating the merge.
+        Secondary-bank failures are logged and skipped; a primary-bank
+        failure raises (the caller's existing error handling applies).
+        With no extra banks configured this is a plain single-bank arecall.
+        """
+        banks = self._recall_banks or [self._bank_id]
+        primary = banks[0]
+        secondary = banks[1:]
+
+        def _kwargs(bank_id: str, budget: str, max_tokens: int) -> dict:
+            kwargs: dict = {
+                "bank_id": bank_id, "query": query,
+                "budget": budget, "max_tokens": max_tokens,
+            }
+            if self._recall_tags:
+                kwargs["tags"] = self._recall_tags
+                kwargs["tags_match"] = self._recall_tags_match
+            if self._recall_types:
+                kwargs["types"] = self._recall_types
+            return kwargs
+
+        def _operation(client):
+            async def _one(bank_id: str, budget: str, max_tokens: int):
+                return await client.arecall(**_kwargs(bank_id, budget, max_tokens))
+
+            async def _fan_out():
+                # Primary is awaited OUTSIDE return_exceptions so its failures
+                # propagate to _run_hindsight_operation's embedded-daemon
+                # reconnect/retry logic unchanged.
+                primary_task = _one(primary, self._budget, self._recall_max_tokens)
+                if not secondary:
+                    return [await primary_task]
+                secondary_task = asyncio.gather(
+                    *[_one(b, "low", max(1024, self._recall_max_tokens // 2)) for b in secondary],
+                    return_exceptions=True,
+                )
+                primary_resp, secondary_resps = await asyncio.gather(primary_task, secondary_task)
+                return [primary_resp] + list(secondary_resps)
+
+            return _fan_out()
+
+        raw = list(self._run_hindsight_operation(_operation))
+        primary_resp, secondary_resps = raw[0], raw[1:]
+        if isinstance(primary_resp, Exception):
+            raise primary_resp
+
+        bank_results: List[tuple] = [
+            (primary, list(getattr(primary_resp, "results", None) or []))
+        ]
+        for bank_id, resp in zip(secondary, secondary_resps):
+            if isinstance(resp, Exception):
+                logger.warning(
+                    "Multi-bank recall: secondary bank %s failed, skipping: %s",
+                    bank_id, resp,
+                )
+                continue
+            bank_results.append((bank_id, list(getattr(resp, "results", None) or [])))
+
+        merged = _merge_bank_results(bank_results)
+        logger.debug("Multi-bank recall: %d banks -> %d merged results",
+                     len(bank_results), len(merged))
+        return merged
+
     def _probe_url(self) -> str:
         """Return the URL to probe /version on.
 
@@ -1804,6 +1908,20 @@ class HindsightMemoryProvider(MemoryProvider):
             user=self._user_id,
             session=self._session_id,
         )
+        # Optional cross-bank recall fan-out (issue #18554). Empty/absent keeps
+        # the single-bank behavior byte-for-byte. The primary bank is always
+        # queried first with the full budget; secondary banks get a low budget.
+        raw_recall_banks = (
+            self._config.get("recall_banks")
+            or os.environ.get("HINDSIGHT_RECALL_BANKS", "")
+        )
+        if isinstance(raw_recall_banks, str):
+            recall_banks = [b.strip() for b in raw_recall_banks.split(",") if b.strip()]
+        elif isinstance(raw_recall_banks, (list, tuple)):
+            recall_banks = [str(b).strip() for b in raw_recall_banks if str(b).strip()]
+        else:
+            recall_banks = []
+        self._recall_banks = [b for b in dict.fromkeys([self._bank_id] + recall_banks)]
         budget = self._config.get("recall_budget") or self._config.get("budget") or banks.get("budget", "mid")
         self._budget = budget if budget in _VALID_BUDGETS else "mid"
 
@@ -2016,21 +2134,10 @@ class HindsightMemoryProvider(MemoryProvider):
                 resp = self._run_hindsight_operation(lambda client: client.areflect(bank_id=self._bank_id, query=query, budget=self._budget))
                 # Reflect synthesizes across many memories -> no discrete count.
                 return _RecallResult(resp.text or "", 0)
-            recall_kwargs: dict = {
-                "bank_id": self._bank_id, "query": query,
-                "budget": self._budget, "max_tokens": self._recall_max_tokens,
-            }
-            if self._recall_tags:
-                recall_kwargs["tags"] = self._recall_tags
-                recall_kwargs["tags_match"] = self._recall_tags_match
-            if self._recall_types:
-                recall_kwargs["types"] = self._recall_types
-            logger.debug("Recall: calling recall (bank=%s, query_len=%d, budget=%s)",
-                         self._bank_id, len(query), self._budget)
-            resp = self._run_hindsight_operation(lambda client: client.arecall(**recall_kwargs))
-            num_results = len(resp.results) if resp.results else 0
+            merged = self._multi_bank_recall_results(query)
+            num_results = len(merged)
             logger.debug("Recall: returned %d results", num_results)
-            text = "\n".join(f"- {r.text}" for r in resp.results if r.text) if resp.results else ""
+            text = "\n".join(f"- {item.text}" for _, item in merged if item.text) if merged else ""
             return _RecallResult(text, num_results)
         except Exception as e:
             logger.debug("Hindsight recall failed: %s", e, exc_info=True)
@@ -2355,23 +2462,17 @@ class HindsightMemoryProvider(MemoryProvider):
             if not query:
                 return tool_error("Missing required parameter: query")
             try:
-                recall_kwargs: dict = {
-                    "bank_id": self._bank_id, "query": query, "budget": self._budget,
-                    "max_tokens": self._recall_max_tokens,
-                }
-                if self._recall_tags:
-                    recall_kwargs["tags"] = self._recall_tags
-                    recall_kwargs["tags_match"] = self._recall_tags_match
-                if self._recall_types:
-                    recall_kwargs["types"] = self._recall_types
-                logger.debug("Tool hindsight_recall: bank=%s, query_len=%d, budget=%s",
-                             self._bank_id, len(query), self._budget)
-                resp = self._run_hindsight_operation(lambda client: client.arecall(**recall_kwargs))
-                num_results = len(resp.results) if resp.results else 0
-                logger.debug("Tool hindsight_recall: %d results", num_results)
-                if not resp.results:
+                logger.debug("Tool hindsight_recall: banks=%s, query_len=%d, budget=%s",
+                             self._recall_banks or [self._bank_id], len(query), self._budget)
+                merged = self._multi_bank_recall_results(query)
+                logger.debug("Tool hindsight_recall: %d results", len(merged))
+                if not merged:
                     return json.dumps({"result": "No relevant memories found."})
-                lines = [f"{i}. {r.text}" for i, r in enumerate(resp.results, 1)]
+                lines = [
+                    f"{i}. {item.text}" + (f"  [@{bank}]" if bank != self._bank_id else "")
+                    for i, (bank, item) in enumerate(merged, 1)
+                    if item.text
+                ]
                 return json.dumps({"result": "\n".join(lines)})
             except Exception as e:
                 logger.warning("hindsight_recall failed: %s", e, exc_info=True)
