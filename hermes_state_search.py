@@ -60,23 +60,34 @@ _FTS5_SPECIAL_RE = re.compile(f"[{re.escape(_FTS5_SPECIAL_CHARS)}]")
 # script detection (:meth:`SessionSearchMixin._detect_lang`).
 #
 # Pack schema:
-#   stopwords  frozenset[str]   dropped from the query entirely
-#   suffixes   tuple[str, ...]  light suffixes stripped before wildcard
-#   endings    frozenset[str]   2-char flexion endings → drop 2 chars
-#   vowels     str              vowel set; trailing vowel → drop 1 char
-#   min_stem   int              shortest prefix kept (precision floor)
+#   stopwords           frozenset[str]   dropped from the query entirely
+#   suffixes            tuple[str, ...]  light suffixes stripped first
+#   endings             frozenset[str]   2-char flexion endings → drop 2
+#   vowels              str              vowel set for trailing-vowel drop
+#   trailing_vowel_drop bool             tail vowel counts as flexion
+#   min_stem            int              shortest prefix kept (precision)
+#   fallback            str              "keep" (stem already) | "drop1"
+#   affinity_stopwords  frozenset[str]   small function-word set used ONLY
+#                                        for Latin-script detection
 #
 # A pack is pure data. Languages whose flexion does not suit these
 # heuristics simply have no pack: they fall back to ``default``
 # (stopword removal + conservative prefixing), never to a wrong match.
+#
+# Pack selection (:meth:`SessionSearchMixin._detect_lang`) is two-stage:
+# non-Latin scripts are unambiguous (Cyrillic → ``ru``), while Latin-
+# script languages share one alphabet and are scored by stopword
+# affinity — the pack whose function words appear in the query wins,
+# ties and zero scores degrade to ``default``.
 #
 # CJK queries never reach this path — the dedicated trigram/CJK routes
 # upstream of expansion already handle them (#54242).
 # ----------------------------------------------------------------------
 _NL_LANG_PACKS = {
     "default": {
-        # English + conservative universal layer. Latin terms rely on
-        # the light suffix strip in ``_morph_prefix``; no 2-char table.
+        # English + conservative universal layer. Flexion is suffix-based,
+        # so light suffix stripping does the work; whatever remains is
+        # already the stem — keep it whole with the wildcard.
         "stopwords": frozenset(
             """
             a an and are as at be but by for if in into is it no not of on or
@@ -88,8 +99,137 @@ _NL_LANG_PACKS = {
         ),
         "suffixes": ("ing", "ed", "es", "'s", "s"),
         "endings": frozenset(),
-        "vowels": "aeiou",
+        "vowels": "",
         "min_stem": 4,
+        # No trailing-vowel drop, no drop-1: a consonant-final Latin token
+        # is usually the stem itself ("config"), unlike agglutinative/
+        # fusional scripts where the tail carries flexion.
+        "trailing_vowel_drop": False,
+        "fallback": "keep",
+    },
+    # --- Latin-script language packs (pure data; see schema above) -----
+    "es": {
+        "stopwords": frozenset(
+            """
+            el la los las un una unos unas y o u pero si no de del al en con
+            por para sin sobre entre como que qué cuál cuáles cuándo dónde
+            quién quiénes cuánto cuántos mi mis tu tus su sus nuestro nuestra
+            nuestros nuestras vuestro vuestra vuestros vuestras es son era
+            eran será serán estar está están este esta estos estas ese esa
+            esos esas aquel aquella hay habia han he has hemos hacer haz
+            dime muestra explicar comprueba revisar decir porfavor
+            """.split()
+        ),
+        "affinity_stopwords": frozenset(
+            """
+            el los las unos unas del al que qué cuál cuándo dónde cómo
+            por para con sin sobre y o u pero es son está están hay
+            """.split()
+        ),
+        "suffixes": ("ando", "iendo", "aron", "aron", "ción", "ciones", "mente", "es", "s", "o", "a"),
+        "endings": frozenset({"ar", "er", "ir", "os", "as", "es", "ón", "an", "en", "ía"}),
+        "vowels": "aeiouáéíóúü",
+        "min_stem": 4,
+        "trailing_vowel_drop": True,
+        "fallback": "drop1",
+    },
+    "fr": {
+        "stopwords": frozenset(
+            """
+            le la les un une des du au aux et ou mais si ne pas de en dans sur
+            sous avec sans pour par comme que quoi quel quelle quels quelles
+            quand où qui combien mon ma mes ton ta tes son sa ses notre nos
+            votre vos leur leurs est sont était était sera seront ce cet cette
+            ces il elle ils elles je tu nous vous on faire dis disons montre
+            explique vérifie dis-moi s'il
+            """.split()
+        ),
+        "affinity_stopwords": frozenset(
+            """
+            le les des du au aux et ou mais ne pas que quoi quel quelle
+            quand où qui est sont cette ces pour par sur dans avec sans
+            """.split()
+        ),
+        "suffixes": ("ement", "ation", "eux", "eaux", "ent", "ante", "ants", "es", "e", "s"),
+        "endings": frozenset({"nt", "ez", "ai", "oi", "on", "ie", "ux", "eau", "ée", "és"}),
+        "vowels": "aeiouàâäéèêëîïôöùûüÿ",
+        "min_stem": 4,
+        "trailing_vowel_drop": True,
+        "fallback": "drop1",
+    },
+    "de": {
+        "stopwords": frozenset(
+            """
+            der die das ein eine einen einem einer eines und oder aber wenn
+            von vom zu zum zur im in an am auf aus bei mit nach über unter
+            für um durch gegen ohne wie was wer wen wem wo wann warum welche
+            welcher welches welchen meinem meiner mein meine dein deine sein
+            seine ihr ihre unser unsere ist sind war waren wird werden würde
+            würden hat haben hatte hatten kann können muss müssen soll soll
+            machen sag sagst zeig erkläre prüfe bitte
+            """.split()
+        ),
+        "affinity_stopwords": frozenset(
+            """
+            der die das ein eine einen dem den des und oder aber wie was
+            wer wo wann warum mit von zu zum zur im in auf aus bei für
+            ist sind war wird werden kann nicht auch noch schon
+            """.split()
+        ),
+        "suffixes": ("ung", "ungen", "keit", "heit", "lich", "isch", "end", "er", "es", "en", "em", "e", "n", "s"),
+        "endings": frozenset({"en", "er", "es", "em", "st", "te", "un", "ig", "ich"}),
+        "vowels": "aeiouäöü",
+        "min_stem": 4,
+        "trailing_vowel_drop": False,
+        "fallback": "drop1",
+    },
+    "pt": {
+        "stopwords": frozenset(
+            """
+            o a os as um uma uns umas e ou mas se não de do da dos das no na
+            nos nas em por pelo pela com sem sob sobre entre como que qual
+            quais quando onde quem quanto meu minha meus minhas teu tua seu
+            sua nosso nossa é são era eram será estar está estão este esta
+            esses essas aquele aquela há fazer diz mostra explica verifica
+            porfavor
+            """.split()
+        ),
+        "affinity_stopwords": frozenset(
+            """
+            os as uns umas do da dos das no na nos nas em pelo pela com sem
+            que qual quando onde quem é são não e ou mas mas sobre está estão
+            """.split()
+        ),
+        "suffixes": ("ando", "endo", "ção", "ções", "mente", "aram", "eria", "aria", "es", "s", "o", "a"),
+        "endings": frozenset({"ar", "er", "ir", "os", "as", "es", "ão", "am", "em", "ia"}),
+        "vowels": "aeiouáâãàéêíóôõú",
+        "min_stem": 4,
+        "trailing_vowel_drop": True,
+        "fallback": "drop1",
+    },
+    "it": {
+        "stopwords": frozenset(
+            """
+            il lo la i gli le un uno una di del della dei degli delle in nel
+            nella con sul sulla su per tra fra senza come che cosa quale quali
+            quando dove chi quanto mio mia miei mie tuo tua suo sua nostro
+            nostra è sono era erano sarà stare sta stanno fare dimmi mostra
+            spiega controlla per favore
+            """.split()
+        ),
+        "affinity_stopwords": frozenset(
+            """
+            il lo gli le un uno una di del della dei degli delle nel nella
+            sul sulla che cosa quale quando dove chi è sono non e o ma per
+            con su tra fra senza come
+            """.split()
+        ),
+        "suffixes": ("ando", "endo", "zione", "zioni", "mente", "ato", "ata", "iti", "ate", "ono", "ano", "ono", "i", "e", "o", "a"),
+        "endings": frozenset({"re", "si", "ci", "gi", "io", "ia", "ua", "uo", "ò", "à"}),
+        "vowels": "aeiouàèéìòù",
+        "min_stem": 4,
+        "trailing_vowel_drop": True,
+        "fallback": "drop1",
     },
 }
 
@@ -1366,18 +1506,35 @@ class SessionSearchMixin:
 
     @staticmethod
     def _detect_lang(query: str) -> str:
-        """Pick a language pack by Unicode script of the raw query.
+        """Pick a language pack for the raw query (two-stage detection).
 
-        Script detection is deliberately coarse: Cyrillic anywhere in the
-        query selects ``ru`` when that pack exists, otherwise ``default``;
-        everything else (Latin, mixed, digits-only, unknown scripts) gets
-        ``default``. Packs whose flexion does not fit the heuristics simply
-        do not exist in ``_NL_LANG_PACKS`` — unknown scripts degrade to the
+        Stage 1 — script: non-Latin scripts are unambiguous. Cyrillic
+        anywhere in the query selects ``ru`` when that pack exists.
+        Everything else falls through to stage 2.
+
+        Stage 2 — affinity: Latin-script languages share one alphabet, so
+        each pack's ``affinity_stopwords`` (small function-word set) is
+        scored against the query tokens; the best-scoring pack wins.
+        Ties and zero scores degrade to ``default``.
+
+        Packs whose flexion does not fit the heuristics simply do not
+        exist in ``_NL_LANG_PACKS`` — unknown queries degrade to the
         conservative default pack rather than a wrong match.
         """
         if re.search(r"[а-яё]", query, re.IGNORECASE):
             return "ru" if "ru" in _NL_LANG_PACKS else "default"
-        return "default"
+        # Word-char tokenization (not whitespace+strip): clitics like
+        # French "dov'è" or Spanish "¿dónde" must shed punctuation.
+        tokens = set(re.findall(r"[^\W_]+", query.lower()))
+        best_lang, best_score = "default", 0
+        for lang, pack in _NL_LANG_PACKS.items():
+            aff = pack.get("affinity_stopwords")
+            if not aff:
+                continue  # default/EN has no affinity set: it IS the fallback
+            score = len(tokens & aff)
+            if score > best_score:
+                best_lang, best_score = lang, score
+        return best_lang
 
     def _expand_nl_query(
         self,
@@ -1408,8 +1565,10 @@ class SessionSearchMixin:
         stopwords = pack["stopwords"]
         suffixes = tuple(pack.get("suffixes", ()))
         endings = pack.get("endings", frozenset())
-        vowels = pack.get("vowels", "aeiou")
+        vowels = pack.get("vowels", "")
         min_stem = pack.get("min_stem", 4)
+        vowel_drop = bool(pack.get("trailing_vowel_drop", True))
+        fallback = pack.get("fallback", "drop1")
         meaningful: List[str] = []
         and_parts: List[str] = []
         or_parts: List[str] = []
@@ -1424,6 +1583,7 @@ class SessionSearchMixin:
             prefixed = self._morph_prefix(
                 sub, suffixes=suffixes, endings=endings,
                 vowels=vowels, min_stem=min_stem,
+                trailing_vowel_drop=vowel_drop, fallback=fallback,
             )
             and_parts.append(prefixed)
             or_parts.append(prefixed)
@@ -1437,8 +1597,8 @@ class SessionSearchMixin:
                 # separators (ssh-config, 10.10.20.0/24) is not a real
                 # exact-phrase intent — split it like a bare token. Pure
                 # word phrases (spaces only) keep exact-phrase semantics.
-                if re.search(r"[^A-Za-zА-Яа-яЁё0-9\s]", phrase):
-                    for sub in re.split(r"[^A-Za-zА-Яа-яЁё0-9]+", phrase):
+                if re.search(r"[^\w\s]", phrase):
+                    for sub in re.split(r"[^\w]+", phrase):
                         _add_subtoken(sub)
                 else:
                     meaningful.append(phrase)
@@ -1448,7 +1608,7 @@ class SessionSearchMixin:
             tok = raw_tok.strip('"').strip("*").strip()
             if not tok or tok.upper() in {"AND", "OR", "NOT", "NEAR"}:
                 continue
-            for sub in re.split(r"[^A-Za-zА-Яа-яЁё0-9]+", tok):
+            for sub in re.split(r"[^\w]+", tok):
                 _add_subtoken(sub)
         if len(meaningful) < 2:
             return None
@@ -1464,8 +1624,10 @@ class SessionSearchMixin:
         *,
         suffixes: Tuple[str, ...] = (),
         endings: Collection[str] = frozenset(),
-        vowels: str = "aeiou",
+        vowels: str = "",
         min_stem: int = 4,
+        trailing_vowel_drop: bool = True,
+        fallback: str = "drop1",
     ) -> str:
         """Prefix wildcard for one term; heuristics guided by pack data.
 
@@ -1474,12 +1636,12 @@ class SessionSearchMixin:
 
           - explicit light ``suffixes`` (s/es/ed/ing/'s …) stripped first
             when enough stem remains;
-          - trailing vowel → drop that one char ("servers"→"server*";
-            usually a flexion marker or harmless to lose);
-          - 2-char flexion ``endings`` → drop 2 ("servers"→"server*");
-          - stem at exactly ``min_stem`` length → keep whole with ``*``;
-          - anything else → drop 1 ("testing"→"testin*" still matches
-            test/tests/testing).
+          - trailing vowel → drop that one char, when the pack says the
+            tail is flexion ("servers"→"server*");
+          - 2-char flexion ``endings`` → drop 2;
+          - otherwise the pack ``fallback`` decides: ``keep`` (Latin stems
+            are usually already the stem: "config"→"config*") or
+            ``drop1`` (agglutinative tails carry flexion).
 
         Tokens shorter than ``min_stem`` are returned unchanged.
         """
@@ -1489,13 +1651,12 @@ class SessionSearchMixin:
         for suf in suffixes:
             if suf and low.endswith(suf) and len(tok) - len(suf) >= min_stem:
                 return f"{tok[: len(tok) - len(suf)]}*"
-        if low[-1] in vowels:
+        if trailing_vowel_drop and vowels and low[-1] in vowels:
             return f"{tok[:-1]}*"
-        if (
-            len(tok) >= min_stem + 2
-            and tok[-2:].lower() in endings
-        ):
+        if len(tok) >= min_stem + 2 and tok[-2:].lower() in endings:
             return f"{tok[:-2]}*"
+        if fallback == "keep":
+            return f"{tok}*"
         if len(tok) == min_stem:
             return f"{tok}*"
         return f"{tok[:-1]}*"

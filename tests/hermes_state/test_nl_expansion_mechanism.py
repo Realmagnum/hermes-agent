@@ -27,12 +27,25 @@ class TestDetectLang:
 
     def test_unknown_script_gets_default(self):
         assert SessionSearchMixin._detect_lang("配置 服务器") == "default"
-        assert SessionSearchMixin._detect_lang("réglages du serveur") == "default"
+        # Latin-script languages are detected by stopword affinity
+        assert SessionSearchMixin._detect_lang("où est la configuration") == "fr"
+        assert SessionSearchMixin._detect_lang("dónde está la configuración") == "es"
 
-    def test_registry_ships_no_hidden_language_packs(self):
-        # The mechanism commit must be language-neutral; packs land as
-        # separate pure-data commits.
-        assert set(_NL_LANG_PACKS) == {"default"}
+    def test_registry_packs_conform_to_schema(self):
+        required = {
+            "stopwords", "suffixes", "endings", "vowels",
+            "min_stem", "trailing_vowel_drop", "fallback",
+        }
+        for lang, pack in _NL_LANG_PACKS.items():
+            missing = required - set(pack)
+            assert not missing, f"{lang} pack missing keys: {missing}"
+            assert pack["fallback"] in {"keep", "drop1"}, lang
+            assert pack["min_stem"] >= 3, lang
+
+    def test_no_russian_pack_yet(self):
+        # Russian lands as its own pure-data commit later in the series;
+        # until then Cyrillic must degrade to default, never fail.
+        assert "ru" not in _NL_LANG_PACKS
 
     def test_morphology_params_are_explicit_not_global(self):
         # _morph_prefix takes all language data as explicit arguments —
