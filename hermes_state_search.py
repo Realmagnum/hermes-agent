@@ -47,6 +47,53 @@ _FTS5_SPECIAL_CHARS = '+{}():"^@/#&|~[]<>,;!?$=\\\''
 _FTS5_SPECIAL_RE = re.compile(f"[{re.escape(_FTS5_SPECIAL_CHARS)}]")
 
 
+# ----------------------------------------------------------------------
+# Natural-language query expansion for FTS5 session search.
+#
+# Plain FTS5 MATCH is AND-between-tokens with exact token forms, so a
+# natural question ("what did we decide about the config?") usually
+# returns zero rows twice over: stopwords rarely co-occur with the
+# meaningful terms inside one message, and inflection means the indexed
+# form differs from the query form ("configs" vs "config", "servers"
+# vs "server"). The expansion mechanism below is language-agnostic;
+# per-language data lives in ``_NL_LANG_PACKS`` and is selected by
+# script detection (:meth:`SessionSearchMixin._detect_lang`).
+#
+# Pack schema:
+#   stopwords  frozenset[str]   dropped from the query entirely
+#   suffixes   tuple[str, ...]  light suffixes stripped before wildcard
+#   endings    frozenset[str]   2-char flexion endings → drop 2 chars
+#   vowels     str              vowel set; trailing vowel → drop 1 char
+#   min_stem   int              shortest prefix kept (precision floor)
+#
+# A pack is pure data. Languages whose flexion does not suit these
+# heuristics simply have no pack: they fall back to ``default``
+# (stopword removal + conservative prefixing), never to a wrong match.
+#
+# CJK queries never reach this path — the dedicated trigram/CJK routes
+# upstream of expansion already handle them (#54242).
+# ----------------------------------------------------------------------
+_NL_LANG_PACKS = {
+    "default": {
+        # English + conservative universal layer. Latin terms rely on
+        # the light suffix strip in ``_morph_prefix``; no 2-char table.
+        "stopwords": frozenset(
+            """
+            a an and are as at be but by for if in into is it no not of on or
+            s such t that the their then there these they this to was we will
+            with you your do does did how what why when where which who whom
+            whose can could should would may might must shall please help show
+            find tell explain check make give get
+            """.split()
+        ),
+        "suffixes": ("ing", "ed", "es", "'s", "s"),
+        "endings": frozenset(),
+        "vowels": "aeiou",
+        "min_stem": 4,
+    },
+}
+
+
 class SessionSearchMixin:
     """See module docstring — mixin for SessionDB (Search cluster)."""
 
@@ -1318,6 +1365,202 @@ class SessionSearchMixin:
         return run == 1
 
     @staticmethod
+    def _detect_lang(query: str) -> str:
+        """Pick a language pack by Unicode script of the raw query.
+
+        Script detection is deliberately coarse: Cyrillic anywhere in the
+        query selects ``ru`` when that pack exists, otherwise ``default``;
+        everything else (Latin, mixed, digits-only, unknown scripts) gets
+        ``default``. Packs whose flexion does not fit the heuristics simply
+        do not exist in ``_NL_LANG_PACKS`` — unknown scripts degrade to the
+        conservative default pack rather than a wrong match.
+        """
+        if re.search(r"[а-яё]", query, re.IGNORECASE):
+            return "ru" if "ru" in _NL_LANG_PACKS else "default"
+        return "default"
+
+    def _expand_nl_query(
+        self,
+        query: str,
+    ) -> Optional[Dict[str, str]]:
+        """Expand a natural-language query into FTS5-friendly variants.
+
+        A natural question like "what did we decide about the config?"
+        fails plain FTS5 twice: stopwords rarely co-occur with the
+        meaningful terms in one message, and inflection means the indexed
+        form differs from the query form ("configs" vs "config"). This
+        method builds up to three progressively looser FTS5 queries:
+
+          - ``and``: meaningful terms with prefix wildcards, AND-joined
+            (fixes morphology while keeping precision);
+          - ``or``: the same terms OR-joined (fixes the multi-message
+            stopword problem — any term anywhere);
+          - ``bare``: meaningful terms without wildcards, for the trigram /
+            LIKE substring paths downstream.
+
+        Language data comes from the ``_NL_LANG_PACKS`` entry selected by
+        :meth:`_detect_lang`; the mechanism itself is language-agnostic.
+        Returns ``None`` when the query has fewer than two meaningful terms
+        (nothing to gain from expansion) or is entirely stopwords.
+        """
+        lang = self._detect_lang(query)
+        pack = _NL_LANG_PACKS.get(lang, _NL_LANG_PACKS["default"])
+        stopwords = pack["stopwords"]
+        suffixes = tuple(pack.get("suffixes", ()))
+        endings = pack.get("endings", frozenset())
+        vowels = pack.get("vowels", "aeiou")
+        min_stem = pack.get("min_stem", 4)
+        meaningful: List[str] = []
+        and_parts: List[str] = []
+        or_parts: List[str] = []
+
+        def _add_subtoken(sub: str) -> None:
+            """Normalise one atomic token (no separators) into the variants."""
+            if not sub or not re.search(r"[^\W\d_]", sub):  # letters only
+                return
+            if sub.lower() in stopwords:
+                return
+            meaningful.append(sub)
+            prefixed = self._morph_prefix(
+                sub, suffixes=suffixes, endings=endings,
+                vowels=vowels, min_stem=min_stem,
+            )
+            and_parts.append(prefixed)
+            or_parts.append(prefixed)
+
+        for raw_tok in re.findall(r'"[^"]+"|\S+', query):
+            if raw_tok.startswith('"') and raw_tok.endswith('"'):
+                phrase = raw_tok[1:-1].strip()
+                if not phrase:
+                    continue
+                # A quoted phrase that the sanitizer wrapped because of
+                # separators (ssh-config, 10.10.20.0/24) is not a real
+                # exact-phrase intent — split it like a bare token. Pure
+                # word phrases (spaces only) keep exact-phrase semantics.
+                if re.search(r"[^A-Za-zА-Яа-яЁё0-9\s]", phrase):
+                    for sub in re.split(r"[^A-Za-zА-Яа-яЁё0-9]+", phrase):
+                        _add_subtoken(sub)
+                else:
+                    meaningful.append(phrase)
+                    and_parts.append(raw_tok)
+                    or_parts.append(raw_tok)
+                continue
+            tok = raw_tok.strip('"').strip("*").strip()
+            if not tok or tok.upper() in {"AND", "OR", "NOT", "NEAR"}:
+                continue
+            for sub in re.split(r"[^A-Za-zА-Яа-яЁё0-9]+", tok):
+                _add_subtoken(sub)
+        if len(meaningful) < 2:
+            return None
+        return {
+            "and": " AND ".join(and_parts) if len(and_parts) > 1 else and_parts[0],
+            "or": " OR ".join(or_parts),
+            "bare": " ".join(meaningful),
+        }
+
+    @staticmethod
+    def _morph_prefix(
+        tok: str,
+        *,
+        suffixes: Tuple[str, ...] = (),
+        endings: Collection[str] = frozenset(),
+        vowels: str = "aeiou",
+        min_stem: int = 4,
+    ) -> str:
+        """Prefix wildcard for one term; heuristics guided by pack data.
+
+        Inflection lives in the suffix for most natural languages. The
+        heuristic is recall-oriented and needs no morphology library:
+
+          - explicit light ``suffixes`` (s/es/ed/ing/'s …) stripped first
+            when enough stem remains;
+          - trailing vowel → drop that one char ("servers"→"server*";
+            usually a flexion marker or harmless to lose);
+          - 2-char flexion ``endings`` → drop 2 ("servers"→"server*");
+          - stem at exactly ``min_stem`` length → keep whole with ``*``;
+          - anything else → drop 1 ("testing"→"testin*" still matches
+            test/tests/testing).
+
+        Tokens shorter than ``min_stem`` are returned unchanged.
+        """
+        if len(tok) < min_stem:
+            return tok
+        low = tok.lower()
+        for suf in suffixes:
+            if suf and low.endswith(suf) and len(tok) - len(suf) >= min_stem:
+                return f"{tok[: len(tok) - len(suf)]}*"
+        if low[-1] in vowels:
+            return f"{tok[:-1]}*"
+        if (
+            len(tok) >= min_stem + 2
+            and tok[-2:].lower() in endings
+        ):
+            return f"{tok[:-2]}*"
+        if len(tok) == min_stem:
+            return f"{tok}*"
+        return f"{tok[:-1]}*"
+
+    def _run_fts5_search(
+        self,
+        fts_query: str,
+        *,
+        order_by_sql: str,
+        include_inactive: bool,
+        source_filter: List[str] = None,
+        exclude_sources: List[str] = None,
+        role_filter: List[str] = None,
+        limit: int = 20,
+        offset: int = 0,
+    ) -> Optional[List[Dict[str, Any]]]:
+        """Run a raw FTS5 query against the main ``messages_fts`` table.
+
+        Unlike ``search_messages``' inline SQL this takes the MATCH
+        expression verbatim (no extra quoting) — used by the NL-expansion
+        fallback which already builds a syntactically valid query with prefix
+        wildcards and OR groups. Returns rows in the same shape as the main
+        path, or ``None`` when the query fails at runtime so the caller can
+        continue down the fallback chain.
+        """
+        fts_where = ["messages_fts MATCH ?"]
+        fts_params: list = [fts_query]
+        if not include_inactive:
+            fts_where.append("(m.active = 1 OR m.compacted = 1)")
+        if source_filter is not None:
+            fts_where.append(f"s.source IN ({','.join('?' for _ in source_filter)})")
+            fts_params.extend(source_filter)
+        if exclude_sources is not None:
+            fts_where.append(f"s.source NOT IN ({','.join('?' for _ in exclude_sources)})")
+            fts_params.extend(exclude_sources)
+        if role_filter:
+            fts_where.append(f"m.role IN ({','.join('?' for _ in role_filter)})")
+            fts_params.extend(role_filter)
+        fts_sql = f"""
+            SELECT
+                m.id,
+                m.session_id,
+                m.role,
+                snippet(messages_fts, -1, '>>>', '<<<', '...', 40) AS snippet,
+                m.timestamp,
+                m.tool_name,
+                s.source,
+                s.model,
+                s.started_at AS session_started
+            FROM messages_fts
+            JOIN messages m ON m.id = messages_fts.rowid
+            JOIN sessions s ON s.id = m.session_id
+            WHERE {' AND '.join(fts_where)}
+            {order_by_sql}
+            LIMIT ? OFFSET ?
+        """
+        fts_params.extend([limit, offset])
+        with self._read_ctx() as conn:
+            try:
+                cursor = conn.execute(fts_sql, fts_params)
+            except sqlite3.OperationalError:
+                return None
+            return [dict(row) for row in cursor.fetchall()]
+
+    @staticmethod
     def _trigram_eligible_tokens(query: str) -> bool:
         """True when every non-operator token is long enough for the trigram
         tokenizer to match (>=3 chars).
@@ -2179,7 +2422,33 @@ class SessionSearchMixin:
             and not is_cjk
             and not (bool(role_filter) and "tool" in role_filter)
         ):
-            _fb_query = query.strip('"').strip()
+            # ── NL expansion: stopwords + light morphology ──
+            # A natural-language question usually fails plain FTS5 twice:
+            # AND-between-tokens across messages and inflected word forms.
+            # Try progressively looser exact-index variants before the
+            # substring fallbacks: prefixed AND (fixes morphology, keeps
+            # precision) → prefixed OR (fixes the stopword/AND failure).
+            # Strictly additive: only runs when the exact search returned
+            # nothing, and never reorders existing hits.
+            expanded = self._expand_nl_query(query)
+            if expanded:
+                for _nl_key in ("and", "or"):
+                    _nl_matches = self._run_fts5_search(
+                        expanded[_nl_key],
+                        order_by_sql=order_by_sql,
+                        include_inactive=include_inactive,
+                        source_filter=source_filter,
+                        exclude_sources=exclude_sources,
+                        role_filter=role_filter,
+                        limit=limit,
+                        offset=offset,
+                    )
+                    if _nl_matches:
+                        matches = _nl_matches
+                        break
+            # The substring-capable indexes below get the stopword-stripped
+            # query so they don't trip over function words either.
+            _fb_query = (expanded["bare"] if expanded else query).strip('"').strip()
             if self._fts_cjk_available:
                 cjk_fb = self._run_trigram_search(
                     _fb_query,
