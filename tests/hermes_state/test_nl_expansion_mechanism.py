@@ -22,8 +22,9 @@ def db(tmp_path):
 
 
 class TestDetectLang:
-    def test_cyrillic_maps_to_ru_only_when_pack_exists(self):
-        assert SessionSearchMixin._detect_lang("сколько серверов") == "default"
+    def test_cyrillic_maps_by_script(self):
+        # Cyrillic → ru pack (script detection is unambiguous)
+        assert SessionSearchMixin._detect_lang("сколько серверов") == "ru"
 
     def test_unknown_script_gets_default(self):
         assert SessionSearchMixin._detect_lang("配置 服务器") == "default"
@@ -42,10 +43,12 @@ class TestDetectLang:
             assert pack["fallback"] in {"keep", "drop1"}, lang
             assert pack["min_stem"] >= 3, lang
 
-    def test_no_russian_pack_yet(self):
-        # Russian lands as its own pure-data commit later in the series;
-        # until then Cyrillic must degrade to default, never fail.
-        assert "ru" not in _NL_LANG_PACKS
+    def test_no_hidden_language_packs_beyond_declared(self):
+        # The mechanism commit ships default only; every further pack is
+        # its own pure-data commit (es/fr/de/pt/it, then ru).
+        assert set(_NL_LANG_PACKS) == {
+            "default", "ru", "es", "fr", "de", "pt", "it",
+        }
 
     def test_morphology_params_are_explicit_not_global(self):
         # _morph_prefix takes all language data as explicit arguments —
