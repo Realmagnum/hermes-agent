@@ -148,7 +148,7 @@ from gateway.platforms.base import (
 from plugins.platforms.telegram.telegram_ids import normalize_telegram_chat_id
 from plugins.platforms.telegram.telegram_network import (
     SEED_FALLBACK_IPS, TelegramFallbackTransport, discover_fallback_ips, parse_fallback_ip_env, tcp_keepalive_socket_options)
-from plugins.platforms.telegram import rich_markdown as rich_md
+from plugins.platforms.telegram.telegram_rich_inbound import TelegramRichInboundMixin
 from utils import env_float, env_int
 
 _TELEGRAM_IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".gif"}
@@ -298,25 +298,6 @@ _RICH_PROTECTED_REGION_RE = re.compile(
     re.MULTILINE)
 
 
-def _rich_media_mime(kind: str, ext: str) -> str:
-    """Map a rich-media kind + file extension to a MIME type for event.media_types."""
-    if kind == "photo":
-        return f"image/{ext.lstrip('.')}" if ext else "image/jpeg"
-    if kind in ("video", "animation"):
-        if ext == ".gif":
-            return "image/gif"
-        if ext == ".webp":
-            return "image/webp"
-        return "video/mp4" if ext == ".mp4" else SUPPORTED_VIDEO_TYPES.get(ext, "video/mp4")
-    if kind == "audio":
-        if ext in (".mp3",):
-            return "audio/mpeg"
-        return "audio/ogg"
-    if kind == "voice_note":
-        return "audio/ogg"
-    return "application/octet-stream"
-
-
 def _rich_normalize_linebreaks(text: str) -> str:
     """Convert lone ``\\n`` (a Markdown soft break) to hard breaks for sendRichMessage; ``\\n\\n``,
     fenced code and pipe tables are left untouched."""
@@ -385,7 +366,7 @@ class _PollingLifecycleAbort(RuntimeError):
     """Internal control flow for polling startup fenced by teardown."""
 
 
-class TelegramAdapter(BasePlatformAdapter):
+class TelegramAdapter(TelegramRichInboundMixin, BasePlatformAdapter):
     """Telegram bot adapter: users/groups, MarkdownV2 replies, forum topics, media."""
 
     MAX_MESSAGE_LENGTH = 4096
@@ -5550,76 +5531,6 @@ class TelegramAdapter(BasePlatformAdapter):
                 event, cached, f"[Replied-to {cached.kind} '{cached.display_name}' saved at: {cached.path}]",
                 "[Telegram] Cached replied-to %s at %s")
 
-    async def _cache_rich_media(self, rich_message: Any, event: MessageEvent) -> List[str]:
-        """Download and cache media blocks embedded in a rich message.
-
-        Rich-message media blocks (photo/video/audio/voice_note/animation)
-        carry raw dicts (not PTB objects), so we resolve each ``file_id`` via
-        the bot's ``get_file`` and cache bytes locally — the same cache the
-        ordinary media path uses, so downstream vision/STT can read the file
-        even after Telegram's ephemeral file URL expires.
-
-        Returns the list of newly cached local paths (also appended to
-        ``event.media_urls`` / ``event.media_types``).
-        """
-        if not rich_message:
-            return []
-        added: List[str] = []
-        try:
-            _markdown, media = rich_md.rich_message_to_markdown(rich_message)
-        except Exception:
-            logger.debug("[Telegram] rich_md parse error", exc_info=True)
-            return added
-        for kind, node, _caption in media:
-            file_id = None
-            # pull the largest photo size, else the single media object's file_id
-            for key in ("photo", "video", "audio", "voice_note", "animation"):
-                val = node.get(key)
-                if isinstance(val, list) and val:
-                    last = val[-1]
-                    if isinstance(last, dict):
-                        file_id = last.get("file_id")
-                    else:
-                        file_id = getattr(last, "file_id", None)
-                elif isinstance(val, dict):
-                    file_id = val.get("file_id")
-                if file_id:
-                    break
-            if not file_id or not self._bot:
-                continue
-            try:
-                file_obj = await self._bot.get_file(file_id)
-                data = bytes(await file_obj.download_as_bytearray())
-                ext = os.path.splitext(getattr(file_obj, "file_path", "") or "")[1]
-                if kind == "photo":
-                    if ext not in _TELEGRAM_IMAGE_EXTENSIONS:
-                        ext = ".jpg"
-                    cached_path = await cache_image_from_bytes_async(data, ext=ext)
-                elif kind == "voice_note":
-                    cached_path = await cache_audio_from_bytes_async(data, ext=".ogg")
-                elif kind == "audio":
-                    mime_ext = ext if ext in (".mp3", ".ogg", ".m4a", ".wav", ".opus") else ".mp3"
-                    cached_path = await cache_audio_from_bytes_async(data, ext=mime_ext)
-                elif kind == "video":
-                    mime_ext = ext if ext in (".mp4", ".mov", ".mkv", ".webm") else ".mp4"
-                    cached_path = await cache_video_from_bytes_async(data, ext=mime_ext)
-                elif kind == "animation":
-                    mime_ext = ext if ext in (".gif", ".webp", ".mp4") else ".mp4"
-                    cached_path = await cache_video_from_bytes_async(data, ext=mime_ext)
-                else:
-                    continue
-                event.media_urls.append(cached_path)
-                event.media_types.append(_rich_media_mime(kind, ext))
-                added.append(cached_path)
-                logger.info("[Telegram] Cached rich %s at %s (file_id=%s...)",
-                            kind, cached_path, str(file_id)[:16])
-            except Exception as exc:
-                logger.warning(
-                    "[Telegram] Failed to cache rich %s (file_id=%s...): %s",
-                    kind, str(file_id)[:16], exc, exc_info=True,
-                )
-        return added
-
     def _observed_media_source(self, msg: Message):
         """Return (telegram_file_source, filename, mime, default_kind) or Nones."""
         if msg.photo:
@@ -5788,73 +5699,6 @@ class TelegramAdapter(BasePlatformAdapter):
             return
         await self._ensure_forum_commands(update.message)
         self._enqueue_text_event(await self._build_triggered_event(msg, update, MessageType.TEXT))
-
-    async def _handle_rich_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        """Handle incoming Rich Message (Bot API 10.1+).
-
-        Rich messages from the Telegram Rich Text Editor arrive with empty
-        ``message.text`` — their content lives only in
-        ``message.api_kwargs[\"rich_message\"][\"blocks\"]`` (PTB <22.6 has no
-        ``message.rich_message`` attribute). Because ``message.text`` is empty
-        these messages match none of the normal handlers (TEXT/COMMAND/media)
-        and were silently dropped. This handler extracts the structured rich
-        content, converts it to Markdown (headings, code, blockquotes, lists,
-        tables, emphasis, links/buttons, spoilers preserved), downloads any
-        embedded media for vision/STT, and forwards the result through the
-        normal text pipeline.
-        """
-        msg = self._effective_update_message(update)
-        if not msg:
-            return
-
-        # rich_message may be a first-class attr (PTB 22.6+) or live in
-        # api_kwargs (older). api_kwargs is duck-typed (mapping-like), NOT
-        # necessarily a dict — never isinstance-check it.
-        rich_message = getattr(msg, "rich_message", None)
-        if not rich_message:
-            api_kwargs = getattr(msg, "api_kwargs", None)
-            getter = getattr(api_kwargs, "get", None)
-            if callable(getter):
-                rich_message = getter("rich_message")
-        if not rich_message:
-            # Not a rich message after all — this handler only fires for
-            # messages no other handler claimed.
-            return
-
-        rich_getter = getattr(rich_message, "get", None)
-        blocks = rich_getter("blocks") if callable(rich_getter) else None
-        try:
-            text, _media = rich_md.rich_message_to_markdown(rich_message)
-        except Exception:
-            logger.debug("[Telegram] rich_md render error", exc_info=True)
-            text = self._flatten_rich_blocks(blocks).strip()
-        text = (text or "").strip()
-        if not text:
-            logger.debug("[Telegram] Rich Message with no extractable text, ignoring")
-            return
-
-        if not self._is_user_authorized_from_message(msg):
-            self._log_blocked_user(msg, what="rich message")
-            return
-        if not self._gate_or_observe(msg, update, MessageType.TEXT):
-            return
-        await self._ensure_forum_commands(msg)
-
-        try:
-            event = self._build_message_event(msg, MessageType.TEXT, update_id=update.update_id)
-            event.text = self._clean_bot_trigger_text(text)
-            try:
-                await self._cache_rich_media(rich_message, event)
-            except Exception as _mce:
-                logger.debug("[Telegram] rich media cache error: %s", _mce)
-            await self._cache_replied_media(msg, event)
-            event = self._apply_telegram_group_observe_attribution(event)
-            self._enqueue_text_event(event)
-        except Exception:
-            logger.exception(
-                "[Telegram] Failed to enqueue rich message %s",
-                getattr(msg, "message_id", None),
-            )
 
     async def _handle_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Handle incoming command messages."""
