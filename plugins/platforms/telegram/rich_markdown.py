@@ -93,8 +93,9 @@ def _render_inline(value: Any) -> str:
             label = _render_inline(value.get("text")) or url
             return f"[{label}]({url})" if url else label
         if ntype == "button":
-            # Telegram Rich Text can wrap a link/button as {type: button,
-            # button: {text, url}} (e.g. pasted app-store / web links).
+            # Telegram Rich Text can wrap a clickable link as {type: button,
+            # button: {text, url}} (pasted links, buttons, tg:// deep links).
+            # url is arbitrary — scheme, host and path are preserved verbatim.
             raw_btn = value.get("button")
             btn = raw_btn if isinstance(raw_btn, dict) else {}
             btn_url = str(btn.get("url") or "")

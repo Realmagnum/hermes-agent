@@ -73,8 +73,9 @@ def test_url_email_mention():
 
 
 def test_button_link_renders_as_markdown_url():
-    # Real structure seen in live dumps: a pasted app-store / web link arrives
-    # as {type: button, button: {text, url}}, NOT {type: url}.
+    # Live-dump structure: a pasted clickable link arrives as
+    # {type: button, button: {text, url}}, NOT {type: url}. The URL is
+    # arbitrary — render it verbatim as [text](url).
     md, _ = _render([{
         "type": "paragraph",
         "text": [
@@ -87,6 +88,38 @@ def test_button_link_renders_as_markdown_url():
     }])
     assert md == "[Ссылка](https://apps.apple.com/app/id6761788641) на игру."
     assert "https://apps.apple.com/app/id6761788641" in md
+
+
+def test_button_and_url_preserve_arbitrary_urls():
+    """URL/button rendering is domain-agnostic: any scheme/host/path is
+    preserved verbatim, and an empty label falls back to the URL itself."""
+    urls = [
+        "http://example.org",                                   # plain http
+        "https://localhost:8080/api?q=1&r=2",                   # port + query
+        "https://en.wikipedia.org/wiki/URL#Syntax",            # fragment
+        "https://пример.рф/путь",                               # IDN host
+        "ftp://files.example.net/pub?a=b",                     # non-http scheme
+        "tg://resolve?domain=somebot",                          # deep link
+        "https://user:pass@host.example:8443/x",               # userinfo + port
+    ]
+    for u in urls:
+        md, _ = _render([{
+            "type": "paragraph",
+            "text": [{"type": "url", "text": "label", "url": u}],
+        }])
+        assert md == f"[label]({u})", f"url node mismatch for {u!r}"
+        bd, _ = _render([{
+            "type": "paragraph",
+            "text": [{"type": "button", "button": {"text": "label", "url": u}}],
+        }])
+        assert bd == f"[label]({u})", f"button node mismatch for {u!r}"
+    # empty label -> label falls back to the URL itself
+    for ntype in ("url", "button"):
+        node = ({"type": ntype, "url": "https://bare.example"}
+                if ntype == "url" else
+                {"type": ntype, "button": {"text": "", "url": "https://bare.example"}})
+        md, _ = _render([{"type": "paragraph", "text": [node]}])
+        assert md == "[https://bare.example](https://bare.example)", f"empty label {ntype}"
 
 
 def test_divider_and_footer():
@@ -280,8 +313,8 @@ def test_full_editor_styles_integration():
         ]},
         {"type": "mathematical_expression", "expression": "E = mc^2"},
         {"type": "paragraph", "text": [
-            {"type": "button", "button": {"text": "App",
-             "url": "https://apps.apple.com/app/id6761788641"}}]},
+            {"type": "button", "button": {"text": "Ссылка",
+             "url": "https://example.org/app/123"}}]},
     ])
     # structural assertions for every style option
     assert "# Заголовок 1" in md
@@ -296,4 +329,4 @@ def test_full_editor_styles_integration():
     assert "- пункт" in md and "[ ] todo" in md
     assert "| A |" in md and "| 1 |" in md
     assert "E = mc^2" in md
-    assert "apps.apple.com/app/id6761788641" in md
+    assert "https://example.org/app/123" in md
